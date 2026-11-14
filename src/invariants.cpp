@@ -124,7 +124,7 @@ InvariantReport AgentScheduler::check_invariants() const {
         violate(report, invariant::active_assignment_has_current_lease, subject,
                 "active assignment has no lease record");
       }
-      if (agent_entry != impl.agents.end() && internal::boot_is_fenced(impl, binding.boot)) {
+      if (agent_entry != impl.agents.end() && internal::boot_is_fenced(impl, binding.agent, binding.boot)) {
         violate(report, invariant::fenced_boot_has_no_authority, subject,
                 "active assignment references a fenced incarnation");
       }
@@ -268,7 +268,7 @@ InvariantReport AgentScheduler::check_invariants() const {
       violate(report, invariant::capacity_not_exceeded, subject,
               "agent active assignments exceed declared concurrency");
     }
-    if (internal::boot_is_fenced(impl, record.descriptor.boot) &&
+    if (internal::boot_is_fenced(impl, record.descriptor.id, record.descriptor.boot) &&
         (record.lifecycle == AgentLifecycle::Ready || record.lifecycle == AgentLifecycle::Busy)) {
       violate(report, invariant::fenced_boot_has_no_authority, subject,
               "fenced incarnation still reports an accepting lifecycle");

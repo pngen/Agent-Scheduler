@@ -26,7 +26,8 @@ struct CoordinatorOptions {
   std::uint16_t port{0};
   std::string bind_address{"127.0.0.1"};
   ResourceLimits limits{};
-  /// Optional durable state file. Loaded at start when present, saved on stop.
+  /// Optional durable state file. Loaded at start when present, saved right after start
+  /// (so the advanced epochs are durable before any session is served) and on stop.
   std::filesystem::path persistence_path;
   bool load_on_start{true};
   bool persist_on_stop{true};

@@ -244,29 +244,112 @@ void hash_assignment_record(Hasher256& hasher, const AssignmentRecord& record) n
 
 namespace internal {
 
-bool boot_is_fenced(const Impl& impl, AgentBootId boot) {
-  return impl.fenced_boots.find(boot) != impl.fenced_boots.end();
+bool boot_is_fenced(const Impl& impl, AgentId agent, AgentBootId boot) {
+  return impl.fenced_boots.find(std::make_pair(agent, boot)) != impl.fenced_boots.end();
 }
 
 bool incarnation_current(const Impl& impl, const AgentRecord& record, AgentBootId boot) {
   if (record.descriptor.boot != boot) {
     return false;
   }
-  return !boot_is_fenced(impl, boot);
+  return !boot_is_fenced(impl, record.descriptor.id, boot);
 }
 
 void fence_boot(Impl& impl, AgentId agent, AgentBootId boot, AgentGeneration generation, std::string reason) {
-  if (boot.is_zero() || boot_is_fenced(impl, boot)) {
+  if (boot.is_zero() || boot_is_fenced(impl, agent, boot)) {
     return;
+  }
+  // The fence history is bounded like every other growth dimension. When it is full, the
+  // oldest fence of an incarnation that is no longer its agent's current incarnation is
+  // forgotten; the fence that keeps a lost or retired current incarnation out is never.
+  while (impl.fenced_boots.size() >= impl.limits.max_fenced_boots) {
+    auto oldest = impl.fenced_boots.end();
+    for (auto entry = impl.fenced_boots.begin(); entry != impl.fenced_boots.end(); ++entry) {
+      const auto agent_entry = impl.agents.find(entry->first.first);
+      if (agent_entry != impl.agents.end() && agent_entry->second.descriptor.boot == entry->first.second) {
+        continue;
+      }
+      if (oldest == impl.fenced_boots.end() || entry->second.fenced_at_ms < oldest->second.fenced_at_ms) {
+        oldest = entry;
+      }
+    }
+    if (oldest == impl.fenced_boots.end()) {
+      break;
+    }
+    impl.fenced_boots.erase(oldest);
   }
   FencedBoot record;
   record.agent = agent;
   record.boot = boot;
   record.generation = generation;
   record.fenced_at_ms = impl.now_ms();
-  record.reason = std::move(reason);
-  impl.fenced_boots.emplace(boot, record);
+  record.reason = bounded_text(impl, std::move(reason));
+  impl.fenced_boots.emplace(std::make_pair(agent, boot), record);
   impl.state_revision++;
+}
+
+std::string bounded_text(const Impl& impl, std::string text) {
+  if (text.size() > impl.limits.max_string_size) {
+    text.resize(impl.limits.max_string_size);
+  }
+  return text;
+}
+
+bool make_room_for_assignment(Impl& impl) {
+  const std::size_t active = impl.assignments.size() - impl.closed_assignments.size();
+  if (active >= impl.limits.max_active_assignments) {
+    return false;
+  }
+  // A closed assignment's lease carries no authority: the oldest are forgotten first.
+  while (impl.leases.size() >= impl.limits.max_leases && !impl.closed_leases.empty()) {
+    const AssignmentId oldest = impl.closed_leases.front();
+    impl.closed_leases.pop_front();
+    if (const auto found = impl.assignments.find(oldest); found != impl.assignments.end()) {
+      impl.leases.erase(found->second.binding.lease);
+      ++impl.state_revision;
+    }
+  }
+  // Closed assignment records are history: the oldest are forgotten first, except the
+  // latest assignment of a work item, which the work's assignment generation refers to.
+  const std::size_t history_bound = static_cast<std::size_t>(impl.limits.max_active_assignments) +
+                                    static_cast<std::size_t>(impl.limits.max_historical_assignments);
+  for (std::size_t remaining = impl.closed_assignments.size();
+       impl.assignments.size() >= history_bound && remaining > 0; --remaining) {
+    const AssignmentId oldest = impl.closed_assignments.front();
+    impl.closed_assignments.pop_front();
+    const auto found = impl.assignments.find(oldest);
+    if (found == impl.assignments.end()) {
+      continue;
+    }
+    const auto work_entry = impl.work.find(found->second.binding.work);
+    if (work_entry != impl.work.end() &&
+        work_entry->second.last_assignment_generation == found->second.binding.generation) {
+      impl.closed_assignments.push_back(oldest);
+      continue;
+    }
+    impl.leases.erase(found->second.binding.lease);
+    impl.assignments.erase(found);
+    ++impl.state_revision;
+  }
+  return impl.assignments.size() < history_bound && impl.leases.size() < impl.limits.max_leases;
+}
+
+void rebuild_closed_history(Impl& impl) {
+  std::vector<std::pair<std::uint64_t, AssignmentId>> closed;
+  for (const auto& entry : impl.assignments) {
+    if (assignment_state_is_terminal(entry.second.state)) {
+      closed.emplace_back(entry.second.closed_at_ms, entry.first);
+    }
+  }
+  std::sort(closed.begin(), closed.end());
+  impl.closed_assignments.clear();
+  impl.closed_leases.clear();
+  for (const auto& entry : closed) {
+    impl.closed_assignments.push_back(entry.second);
+    if (impl.leases.find(impl.assignments.at(entry.second).binding.lease) != impl.leases.end()) {
+      impl.closed_leases.push_back(entry.second);
+    }
+  }
 }
 
 void index_agent(Impl& impl, const AgentRecord& record) {
@@ -382,15 +465,17 @@ bool capability_fresh(const Impl& impl, const AgentRecord& record) {
   if (record.profile.boot != record.descriptor.boot) {
     return false;
   }
-  if (record.profile.capabilities.empty()) {
-    return true;
-  }
-  const std::uint64_t observed = record.profile.capabilities.front().observed_at_ms;
+  // A profile is only as fresh as its oldest evidence: every capability it asserts must be
+  // current, not just the first one.
   const std::uint64_t now = impl.now_ms();
-  if (observed > now) {
-    return false;
+  std::uint64_t oldest = now;
+  for (const CapabilityEvidence& evidence : record.profile.capabilities) {
+    if (evidence.observed_at_ms > now) {
+      return false;
+    }
+    oldest = std::min(oldest, evidence.observed_at_ms);
   }
-  return (now - observed) <= impl.policy.capability_staleness_ms;
+  return (now - oldest) <= impl.policy.capability_staleness_ms;
 }
 
 bool health_fresh(const Impl& impl, const AgentRecord& record) {
@@ -526,7 +611,9 @@ void close_assignment(Impl& impl,
   record.invalidation = reason;
   record.lease_current = false;
   record.closed_at_ms = impl.now_ms();
-  record.reason = std::move(detail);
+  record.reason = bounded_text(impl, std::move(detail));
+  impl.closed_assignments.push_back(record.binding.id);
+  impl.closed_leases.push_back(record.binding.id);
   const auto lease_entry = impl.leases.find(record.binding.lease);
   if (lease_entry != impl.leases.end()) {
     lease_entry->second.lease.current = false;
@@ -682,7 +769,7 @@ std::optional<ScheduleOutcome> revalidate_authority(const Impl& impl,
     detail = "agent incarnation replaced";
     return ScheduleOutcome::RejectStaleAgentBoot;
   }
-  if (boot_is_fenced(impl, binding.boot)) {
+  if (boot_is_fenced(impl, binding.agent, binding.boot)) {
     detail = "agent incarnation is fenced";
     return ScheduleOutcome::RejectFenced;
   }
@@ -694,6 +781,16 @@ std::optional<ScheduleOutcome> revalidate_authority(const Impl& impl,
     detail = "agent is draining";
     return ScheduleOutcome::RejectDrain;
   }
+  if (binding.placement_domain != agent_record.descriptor.placement_domain ||
+      binding.topology_epoch != agent_record.descriptor.topology_epoch) {
+    detail = "agent placement domain or topology epoch moved";
+    return ScheduleOutcome::RejectLocality;
+  }
+  if (const auto queue_entry = impl.queues.find(binding.queue);
+      queue_entry != impl.queues.end() && queue_entry->second.generation != binding.queue_generation) {
+    detail = "queue generation moved";
+    return ScheduleOutcome::RejectStaleQueueGeneration;
+  }
   if (agent_record.profile.generation != binding.capability_generation ||
       agent_record.profile.profile_id != binding.capability_profile ||
       agent_record.profile.boot != binding.boot || !capability_fresh(impl, agent_record)) {
@@ -701,6 +798,10 @@ std::optional<ScheduleOutcome> revalidate_authority(const Impl& impl,
     return ScheduleOutcome::RejectStaleCapability;
   }
   const WorkRequirements& requirements = work_record.request.requirements;
+  if (requirements.require_ready && !lifecycle_accepts_new_work(agent_record.lifecycle)) {
+    detail = "agent is not ready";
+    return ScheduleOutcome::RejectReadiness;
+  }
   if (requirements.require_current_lease && !lease_current(impl, agent_record)) {
     detail = "registration lease is not current";
     return ScheduleOutcome::RejectLeaseExpired;
@@ -736,15 +837,11 @@ std::optional<ScheduleOutcome> revalidate_authority(const Impl& impl,
   return std::nullopt;
 }
 
-ExternalFeasibilityResult evaluate_feasibility(const Impl& impl, const WorkRecord& record) {
-  if (!impl.feasibility) {
-    ExternalFeasibilityResult result;
-    result.resource = record.request.requirements.resource_feasibility;
-    result.budget = record.request.requirements.budget_feasibility;
-    result.slo = record.request.requirements.slo_feasibility;
-    result.reservation = record.request.requirements.reservation_feasibility;
-    return result;
-  }
+namespace {
+
+thread_local const FeasibilityVerdicts* g_feasibility_verdicts = nullptr;
+
+[[nodiscard]] ExternalFeasibilityRequest feasibility_request(const WorkRecord& record) {
   ExternalFeasibilityRequest request;
   request.work = record.request.id;
   request.work_generation = record.request.generation;
@@ -755,7 +852,67 @@ ExternalFeasibilityResult evaluate_feasibility(const Impl& impl, const WorkRecor
   request.slo_generation = record.request.requirements.slo_generation;
   request.reservation_generation = record.request.requirements.reservation_generation;
   request.deadline_ms = record.request.requirements.deadline_ms;
-  return impl.feasibility->evaluate(request);
+  return request;
+}
+
+[[nodiscard]] bool same_request(const ExternalFeasibilityRequest& left,
+                                const ExternalFeasibilityRequest& right) noexcept {
+  return left.work == right.work && left.work_generation == right.work_generation &&
+         left.tenant == right.tenant && left.name_space == right.name_space &&
+         left.resource_generation == right.resource_generation &&
+         left.budget_generation == right.budget_generation && left.slo_generation == right.slo_generation &&
+         left.reservation_generation == right.reservation_generation && left.deadline_ms == right.deadline_ms;
+}
+
+}  // namespace
+
+FeasibilityScope::FeasibilityScope(const FeasibilityVerdicts& verdicts) noexcept
+    : previous_(g_feasibility_verdicts) {
+  g_feasibility_verdicts = &verdicts;
+}
+
+FeasibilityScope::~FeasibilityScope() { g_feasibility_verdicts = previous_; }
+
+FeasibilityVerdicts evaluate_feasibility_unlocked(Impl& impl, const std::vector<WorkId>& work) {
+  FeasibilityVerdicts verdicts;
+  if (!impl.feasibility || work.empty()) {
+    return verdicts;
+  }
+  std::vector<ExternalFeasibilityRequest> requests;
+  {
+    const std::lock_guard<std::mutex> guard(impl.mutex);
+    for (const WorkId id : work) {
+      const auto found = impl.work.find(id);
+      if (found != impl.work.end()) {
+        requests.push_back(feasibility_request(found->second));
+      }
+    }
+  }
+  for (const ExternalFeasibilityRequest& request : requests) {
+    verdicts.entries.insert_or_assign(request.work, std::make_pair(request, impl.feasibility->evaluate(request)));
+  }
+  return verdicts;
+}
+
+ExternalFeasibilityResult evaluate_feasibility(const Impl& impl, const WorkRecord& record) {
+  if (!impl.feasibility) {
+    ExternalFeasibilityResult result;
+    result.resource = record.request.requirements.resource_feasibility;
+    result.budget = record.request.requirements.budget_feasibility;
+    result.slo = record.request.requirements.slo_feasibility;
+    result.reservation = record.request.requirements.reservation_feasibility;
+    return result;
+  }
+  const ExternalFeasibilityRequest request = feasibility_request(record);
+  if (g_feasibility_verdicts != nullptr) {
+    const auto found = g_feasibility_verdicts->entries.find(request.work);
+    if (found != g_feasibility_verdicts->entries.end() && same_request(found->second.first, request)) {
+      return found->second.second;
+    }
+  }
+  ExternalFeasibilityResult unknown;
+  unknown.detail = "external feasibility was not evaluated for the current work request";
+  return unknown;
 }
 
 Digest256 compute_state_digest(const Impl& impl) {

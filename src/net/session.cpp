@@ -78,19 +78,20 @@ void Session::start() {
 }
 
 void Session::request_close() {
+  // A requested close is graceful: frames already queued (a rejection, a shutdown notice,
+  // a final completion) are still flushed by the writer, without ever waiting on the peer.
+  // The socket is shut down by the writer after that flush and closed by join().
   {
     const std::lock_guard<std::mutex> guard(mutex_);
     if (!closing_) {
       closing_ = true;
       close_reason_ = "close requested";
     }
-    outbound_.clear();
   }
   closed_.store(true, std::memory_order_release);
   if (close_event_ != 0) {
     ::WSASetEvent(as_handle(close_event_));
   }
-  stream_.shutdown_both();
   writable_.notify_all();
 }
 
@@ -186,6 +187,32 @@ Session::IoWait Session::wait_for_io(bool for_write) {
   if (socket_event_ == 0 || close_event_ == 0) {
     return IoWait::Closed;
   }
+  if (for_write) {
+    // The writer never enumerates the socket's network events: that enumeration resets the
+    // shared event and clears recorded events, which would steal the reader's FD_READ or
+    // FD_CLOSE. It polls for writability on its own instead.
+    for (;;) {
+      if (closed_.load(std::memory_order_acquire)) {
+        return IoWait::Closed;
+      }
+      WSAPOLLFD descriptor{};
+      descriptor.fd = static_cast<SOCKET>(stream_.handle());
+      descriptor.events = POLLWRNORM;
+      const int ready = ::WSAPoll(&descriptor, 1, 50);
+      if (ready == SOCKET_ERROR) {
+        return IoWait::Closed;
+      }
+      if (ready == 0) {
+        continue;
+      }
+      if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        return IoWait::Closed;
+      }
+      if ((descriptor.revents & POLLWRNORM) != 0) {
+        return IoWait::Write;
+      }
+    }
+  }
   HANDLE events[2] = {as_handle(socket_event_), as_handle(close_event_)};
   const DWORD index = ::WSAWaitForMultipleEvents(2, events, FALSE, WSA_INFINITE, FALSE);
   if (index == WSA_WAIT_EVENT_0 + 1) {
@@ -199,13 +226,12 @@ Session::IoWait Session::wait_for_io(bool for_write) {
                              &network_events) == SOCKET_ERROR) {
     return IoWait::Closed;
   }
-  if ((network_events.lNetworkEvents & FD_CLOSE) != 0) {
-    return IoWait::Closed;
-  }
   if (closed_.load(std::memory_order_acquire)) {
     return IoWait::Closed;
   }
-  return for_write ? IoWait::Write : IoWait::Read;
+  // FD_CLOSE can arrive together with the last data the peer sent. The reader drains the
+  // socket; it ends when a read reports the orderly close.
+  return IoWait::Read;
 }
 
 void Session::reader_loop() {
@@ -266,7 +292,10 @@ void Session::writer_loop() {
       offset = 0;
       std::unique_lock<std::mutex> lock(mutex_);
       writable_.wait(lock, [this]() { return closing_ || !outbound_.empty(); });
-      if (closing_) {
+      if (outbound_.empty()) {
+        // Closing with nothing left to send.
+        lock.unlock();
+        stream_.shutdown_both();
         return;
       }
       frame = std::move(outbound_.front());
@@ -277,6 +306,12 @@ void Session::writer_loop() {
         std::span<const std::uint8_t>(frame.data() + offset, frame.size() - offset), written);
     offset += written;
     if (result == IoResult::WouldBlock) {
+      if (closed_.load(std::memory_order_acquire)) {
+        // While closing, queued frames are flushed only as far as the socket accepts them
+        // without waiting: a peer that is not reading never holds up a close.
+        stream_.shutdown_both();
+        return;
+      }
       if (wait_for_io(true) == IoWait::Closed) {
         return;
       }

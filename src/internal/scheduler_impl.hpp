@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -101,6 +102,8 @@ struct AgentScheduler::Impl {
   std::function<void()> shutdown_notifier;
 
   mutable std::mutex mutex;
+  /// Serializes save() from the state copy to the file replacement.
+  mutable std::mutex save_mutex;
 
   // ---- canonical authoritative state ----
   SchedulerId scheduler_id{};
@@ -112,9 +115,15 @@ struct AgentScheduler::Impl {
   std::map<WorkId, WorkRecord> work;
   std::map<AssignmentId, AssignmentRecord> assignments;
   std::map<LeaseId, LeaseRecord> leases;
-  std::map<AgentBootId, FencedBoot> fenced_boots;
+  /// Fencing is per incarnation: keyed by (AgentId, AgentBootId), never by boot alone.
+  std::map<std::pair<AgentId, AgentBootId>, FencedBoot> fenced_boots;
   std::map<QueueId, QueueRecord> queues;
   std::map<TenantId, TenantRecord> tenants;
+  /// Closed (terminal) assignments in the order they closed: the history that is
+  /// forgotten first when a bound on assignments or leases is reached.
+  std::deque<AssignmentId> closed_assignments;
+  /// Closed assignments whose lease is still stored, in the order they closed.
+  std::deque<AssignmentId> closed_leases;
   std::uint64_t next_admission_sequence{1};
   std::uint64_t state_revision{0};
   std::uint64_t scheduling_rounds{0};
@@ -143,14 +152,25 @@ namespace internal {
 
 using Impl = AgentScheduler::Impl;
 
-/// True when the incarnation is permanently fenced. Lock must be held.
-[[nodiscard]] bool boot_is_fenced(const Impl& impl, AgentBootId boot);
+/// True when the incarnation (agent, boot) is permanently fenced. Lock must be held.
+[[nodiscard]] bool boot_is_fenced(const Impl& impl, AgentId agent, AgentBootId boot);
 
 /// True when the record still represents the named incarnation and it is not fenced.
 [[nodiscard]] bool incarnation_current(const Impl& impl, const AgentRecord& record, AgentBootId boot);
 
 /// Permanently fences an incarnation. Fencing is scoped to (agent, boot).
 void fence_boot(Impl& impl, AgentId agent, AgentBootId boot, AgentGeneration generation, std::string reason);
+
+/// Keeps assignment history within its bounds before a new assignment is recorded: the
+/// oldest closed assignments and their leases are forgotten first. False when the active
+/// bound is reached or closed history cannot make room. Lock must be held.
+[[nodiscard]] bool make_room_for_assignment(Impl& impl);
+
+/// Rebuilds the closed-assignment history order from canonical state (after recovery).
+void rebuild_closed_history(Impl& impl);
+
+/// Free text kept in state is bounded so that the state always stays encodable.
+[[nodiscard]] std::string bounded_text(const Impl& impl, std::string text);
 
 /// Index maintenance. Lock must be held.
 void index_agent(Impl& impl, const AgentRecord& record);
@@ -217,7 +237,30 @@ void refresh_work_accounting(Impl& impl, WorkRecord& record);
 [[nodiscard]] Digest256 compute_state_digest(const Impl& impl);
 [[nodiscard]] Digest256 compute_agent_generation_digest(const Impl& impl);
 
-/// Applies external feasibility evidence for a work item.
+/// External feasibility verdicts obtained without the state lock, keyed by work item.
+struct FeasibilityVerdicts {
+  std::map<WorkId, std::pair<ExternalFeasibilityRequest, ExternalFeasibilityResult>> entries;
+};
+
+/// Asks the external provider about the named work items. Must be called WITHOUT the
+/// state lock: the requests are collected under the lock, the provider is consulted
+/// after it is released, so a provider may query the scheduler and never stalls it.
+[[nodiscard]] FeasibilityVerdicts evaluate_feasibility_unlocked(Impl& impl, const std::vector<WorkId>& work);
+
+/// Makes verdicts visible to evaluate_feasibility on this thread while in scope.
+class FeasibilityScope {
+ public:
+  explicit FeasibilityScope(const FeasibilityVerdicts& verdicts) noexcept;
+  ~FeasibilityScope();
+  FeasibilityScope(const FeasibilityScope&) = delete;
+  FeasibilityScope& operator=(const FeasibilityScope&) = delete;
+
+ private:
+  const FeasibilityVerdicts* previous_;
+};
+
+/// External feasibility evidence for a work item, from the verdicts in scope. A request
+/// that was not evaluated for the current work generation is UNKNOWN.
 [[nodiscard]] ExternalFeasibilityResult evaluate_feasibility(const Impl& impl, const WorkRecord& record);
 
 /// Fairness ordering key for one admitted work item.

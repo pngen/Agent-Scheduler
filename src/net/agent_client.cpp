@@ -240,6 +240,17 @@ void AgentClient::handle_frame(const Frame& frame) {
         ErrorMessage message;
         decode(reader, message, options_.limits);
         reader.require_exhausted();
+        // An error frame answers the request whose correlation it carries: that request
+        // fails with the coordinator's error instead of waiting for a reply forever.
+        ResultMessage failed;
+        failed.ok = false;
+        failed.outcome = ScheduleOutcome::RejectInvalidRequest;
+        failed.error = make_error(message.code, message.operation, message.subject, message.detail,
+                                  ScheduleOutcome::RejectInvalidRequest);
+        const std::lock_guard<std::mutex> guard(reply_mutex_);
+        last_result_ = failed;
+        last_correlation_ = frame.header.correlation;
+        reply_cv_.notify_all();
         return;
       }
       default:

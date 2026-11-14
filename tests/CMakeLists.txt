@@ -18,7 +18,8 @@ set(AGENT_SCHEDULER_TESTS
   test_limits
   test_synthetic
   test_shutdown
-  test_net)
+  test_net
+  test_regression)
 
 foreach(test_name IN LISTS AGENT_SCHEDULER_TESTS)
   add_executable(${test_name} ${test_name}.cpp ${AGENT_SCHEDULER_TEST_SUPPORT})

@@ -3,6 +3,7 @@
 #include "agent_scheduler/persistence.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -40,6 +41,7 @@ constexpr std::uint32_t kSectionCount = 9;
 constexpr std::uint8_t kLifecycleNormal = 0;
 constexpr std::uint8_t kLifecycleRetired = 1;
 constexpr std::uint8_t kLifecycleLost = 2;
+constexpr std::uint8_t kLifecycleDraining = 3;
 
 std::atomic<std::uint64_t> g_temp_counter{0};
 
@@ -55,6 +57,7 @@ std::atomic<std::uint64_t> g_temp_counter{0};
   switch (lifecycle) {
     case AgentLifecycle::Retired: return kLifecycleRetired;
     case AgentLifecycle::Lost: return kLifecycleLost;
+    case AgentLifecycle::Draining: return kLifecycleDraining;
     default: return kLifecycleNormal;
   }
 }
@@ -63,6 +66,7 @@ std::atomic<std::uint64_t> g_temp_counter{0};
   switch (hint) {
     case kLifecycleRetired: return AgentLifecycle::Retired;
     case kLifecycleLost: return AgentLifecycle::Lost;
+    case kLifecycleDraining: return AgentLifecycle::Draining;
     default: return AgentLifecycle::RevalidationRequired;
   }
 }
@@ -454,7 +458,7 @@ struct DecodedState {
   std::map<WorkId, WorkRecord> work;
   std::map<AssignmentId, AssignmentRecord> assignments;
   std::map<LeaseId, LeaseRecord> leases;
-  std::map<AgentBootId, FencedBoot> fenced_boots;
+  std::map<std::pair<AgentId, AgentBootId>, FencedBoot> fenced_boots;
 };
 
 void write_policy(ByteWriter& writer, const PolicySnapshot& policy, const ResourceLimits& limits) {
@@ -536,9 +540,12 @@ namespace agent_scheduler {
 
 MutationResult AgentScheduler::save(const std::filesystem::path& path,
                                     const PersistOptions& options) const {
+  // Saves are serialized from the state copy to the file replacement, so the file is
+  // always replaced in the order the copies were taken.
+  const std::lock_guard<std::mutex> serialized(impl_->save_mutex);
   std::vector<std::uint8_t> payload;
   std::uint64_t record_count = 0;
-  {
+  try {
     const std::lock_guard<std::mutex> guard(impl_->mutex);
     ByteWriter writer;
     writer.put_u32(kSectionCount);
@@ -651,11 +658,20 @@ MutationResult AgentScheduler::save(const std::filesystem::path& path,
       ++record_count;
     }
     payload = writer.take();
+  } catch (const std::exception& error) {
+    // A save never throws: state that cannot be encoded is reported, and the last good
+    // file is left in place.
+    return persistence_failure(ErrorCode::LimitExceeded, "save", path.string(),
+                               std::string("the state cannot be encoded: ") + error.what());
   }
 
-  const std::uint64_t max_bytes =
-      options.max_bytes != 0 ? options.max_bytes : impl_->limits.max_persistence_bytes;
-  if (payload.size() > max_bytes) {
+  // The bound applies to the file load() reads back, header and trailer included, and
+  // never exceeds the limit load() enforces.
+  const std::uint64_t limit = impl_->limits.max_persistence_bytes;
+  const std::uint64_t max_bytes = options.max_bytes != 0 ? std::min(options.max_bytes, limit) : limit;
+  const std::uint64_t overhead =
+      static_cast<std::uint64_t>(PersistenceFormat::header_bytes) + PersistenceFormat::trailer_bytes;
+  if (max_bytes < overhead || payload.size() > max_bytes - overhead) {
     return persistence_failure(ErrorCode::LimitExceeded, "save", path.string(),
                                "encoded state exceeds the configured persistence byte limit");
   }
@@ -741,8 +757,17 @@ RecoveryResult AgentScheduler::load(const std::filesystem::path& path, const Loa
                                 ScheduleOutcome::RejectInvalidRequest);
       return result;
     }
+    std::array<bool, kSectionCount + 1> seen{};
     for (std::uint32_t section = 0; section < section_count; ++section) {
       const std::uint8_t tag = reader.get_u8();
+      // Every section appears exactly once: a repeated section could bypass a bound or
+      // stand in for a missing one.
+      if (tag >= 1 && tag <= kSectionCount) {
+        if (seen[tag]) {
+          throw DecodeError("duplicate persistence section");
+        }
+        seen[tag] = true;
+      }
       switch (tag) {
         case kSectionScheduler:
           decoded.scheduler_id = SchedulerId{reader.get_u64()};
@@ -801,7 +826,7 @@ RecoveryResult AgentScheduler::load(const std::filesystem::path& path, const Loa
             AgentRecord record;
             record.descriptor = read_descriptor(reader, impl_->limits);
             const std::uint8_t hint = reader.get_u8();
-            if (hint > kLifecycleLost) {
+            if (hint > kLifecycleDraining) {
               throw DecodeError("agent lifecycle hint is out of range");
             }
             record.lifecycle = lifecycle_from_hint(hint);
@@ -856,7 +881,8 @@ RecoveryResult AgentScheduler::load(const std::filesystem::path& path, const Loa
         }
         case kSectionAssignments: {
           const std::uint32_t count = reader.get_u32();
-          if (count > impl_->limits.max_active_assignments + impl_->limits.max_historical_assignments) {
+          if (static_cast<std::uint64_t>(count) > static_cast<std::uint64_t>(impl_->limits.max_active_assignments) +
+                                                      impl_->limits.max_historical_assignments) {
             throw DecodeError("assignment count exceeds the configured maximum");
           }
           for (std::uint32_t index = 0; index < count; ++index) {
@@ -927,7 +953,7 @@ RecoveryResult AgentScheduler::load(const std::filesystem::path& path, const Loa
             record.generation = AgentGeneration{reader.get_u64()};
             record.fenced_at_ms = reader.get_u64();
             record.reason = reader.get_string(impl_->limits.max_string_size);
-            decoded.fenced_boots.emplace(record.boot, std::move(record));
+            decoded.fenced_boots.emplace(std::make_pair(record.agent, record.boot), std::move(record));
           }
           break;
         }
@@ -987,6 +1013,7 @@ RecoveryResult AgentScheduler::load(const std::filesystem::path& path, const Loa
     impl_->shutdown_at_ms = 0;
     impl_->recovered = true;
     internal::rebuild_indexes(*impl_);
+    internal::rebuild_closed_history(*impl_);
     for (auto& entry : impl_->agents) {
       internal::refresh_agent_accounting(*impl_, entry.second);
     }

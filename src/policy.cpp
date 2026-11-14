@@ -91,6 +91,13 @@ MutationResult validate(const PolicySnapshot& policy, const ResourceLimits& limi
                                                 "unknown ranking factor",
                                                 ScheduleOutcome::RejectInvalidRequest));
     }
+    // Factor names are persisted as identifiers; a policy that could not be saved is
+    // refused here rather than when the state is saved.
+    if (weight.factor.size() > limits.max_identifier_size) {
+      return MutationResult::failure(make_error(ErrorCode::LimitExceeded, "set_policy", weight.factor,
+                                                "ranking factor name exceeds max_identifier_size",
+                                                ScheduleOutcome::RejectLimitExceeded));
+    }
     if (weight.weight > 1000000) {
       return MutationResult::failure(make_error(ErrorCode::InvalidArgument, "set_policy", weight.factor,
                                                 "ranking weight exceeds 1000000",

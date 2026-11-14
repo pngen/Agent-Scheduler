@@ -24,7 +24,18 @@ using internal::Impl;
 }
 
 [[nodiscard]] bool stale_boot(const Impl& impl, const AgentRecord& record, AgentBootId boot) {
-  return record.descriptor.boot != boot || internal::boot_is_fenced(impl, boot);
+  return record.descriptor.boot != boot || internal::boot_is_fenced(impl, record.descriptor.id, boot);
+}
+
+/// True when a re-registration of the same incarnation would change what makes the agent
+/// eligible for work it may already hold. Such a change needs a new agent generation.
+[[nodiscard]] bool eligibility_changes(const AgentDescriptor& current, const AgentDescriptor& proposed) {
+  std::vector<std::string> labels = proposed.policy_labels;
+  internal::canonicalize(labels);
+  return current.tenant != proposed.tenant || current.name_space != proposed.name_space ||
+         current.policy_labels != labels || current.placement_domain != proposed.placement_domain ||
+         current.topology_epoch != proposed.topology_epoch ||
+         current.max_concurrency != proposed.max_concurrency;
 }
 
 [[nodiscard]] std::uint32_t effective_lease_ttl(const Impl& impl, const AgentDescriptor& descriptor) {
@@ -39,6 +50,35 @@ void refresh_agent(Impl& impl, AgentRecord& record) {
   internal::deindex_agent(impl, record.descriptor.id);
   internal::refresh_agent_accounting(impl, record);
   internal::index_agent(impl, record);
+}
+
+/// Checks, without changing anything, that ensure_queue() would accept the request.
+[[nodiscard]] MutationResult check_queue(const Impl& impl, const WorkRequest& request) {
+  const auto found = impl.queues.find(request.queue);
+  if (found == impl.queues.end()) {
+    if (impl.queues.size() >= impl.limits.max_queues) {
+      return rejected(ErrorCode::LimitExceeded, "submit_work", request.id.to_string(),
+                      "queue count exceeds max_queues", ScheduleOutcome::RejectLimitExceeded);
+    }
+    return MutationResult::success();
+  }
+  if (request.queue_generation < found->second.generation) {
+    return rejected(ErrorCode::StaleGeneration, "submit_work", request.id.to_string(),
+                    "queue generation is stale", ScheduleOutcome::RejectStaleQueueGeneration);
+  }
+  return MutationResult::success();
+}
+
+/// Checks, without changing anything, that ensure_tenant() would accept the tenant.
+[[nodiscard]] MutationResult check_tenant(const Impl& impl, TenantId tenant) {
+  if (tenant.is_zero() || impl.tenants.find(tenant) != impl.tenants.end()) {
+    return MutationResult::success();
+  }
+  if (impl.tenants.size() >= impl.limits.max_tenants) {
+    return rejected(ErrorCode::LimitExceeded, "submit_work", tenant.to_string(),
+                    "tenant count exceeds max_tenants", ScheduleOutcome::RejectLimitExceeded);
+  }
+  return MutationResult::success();
 }
 
 /// Creates or refreshes the queue record for a work request. Queue records are derived
@@ -88,14 +128,17 @@ void refresh_agent(Impl& impl, AgentRecord& record) {
   return MutationResult::success();
 }
 
+/// Closes every active assignment of one incarnation (agent, boot), never another agent's.
 void close_all_active(Impl& impl,
+                      AgentId agent,
                       AgentBootId boot,
                       AssignmentState state,
                       InvalidationReason reason,
                       std::string detail) {
   for (auto& entry : impl.assignments) {
     AssignmentRecord& record = entry.second;
-    if (record.binding.boot != boot || !assignment_state_is_active(record.state)) {
+    if (record.binding.agent != agent || record.binding.boot != boot ||
+        !assignment_state_is_active(record.state)) {
       continue;
     }
     internal::close_assignment(impl, record, state, reason, detail);
@@ -123,7 +166,10 @@ AgentScheduler::AgentScheduler(SchedulerOptions options) : impl_(std::make_uniqu
 
 AgentScheduler::~AgentScheduler() = default;
 
-SchedulerId AgentScheduler::id() const noexcept { return impl_->scheduler_id; }
+SchedulerId AgentScheduler::id() const noexcept {
+  const std::lock_guard<std::mutex> guard(impl_->mutex);
+  return impl_->scheduler_id;
+}
 
 SchedulerEpoch AgentScheduler::scheduler_epoch() const noexcept {
   const std::lock_guard<std::mutex> guard(impl_->mutex);
@@ -317,7 +363,7 @@ MutationResult AgentScheduler::register_agent(const AgentDescriptor& descriptor)
                         "retired agent cannot re-register at the same generation",
                         ScheduleOutcome::RejectLifecycle);
       }
-      if (internal::boot_is_fenced(*impl_, descriptor.boot)) {
+      if (internal::boot_is_fenced(*impl_, agent, descriptor.boot)) {
         return rejected(ErrorCode::Fenced, "register_agent", agent.to_string(),
                         "incarnation is permanently fenced", ScheduleOutcome::RejectFenced);
       }
@@ -343,16 +389,23 @@ MutationResult AgentScheduler::register_agent(const AgentDescriptor& descriptor)
                       "a new incarnation requires a higher agent generation",
                       ScheduleOutcome::RejectStaleAgentGeneration);
     }
-    if (internal::boot_is_fenced(*impl_, descriptor.boot)) {
+    if (internal::boot_is_fenced(*impl_, agent, descriptor.boot)) {
       return rejected(ErrorCode::Fenced, "register_agent", agent.to_string(),
                       "incarnation is permanently fenced", ScheduleOutcome::RejectFenced);
     }
     if (descriptor.generation > existing.descriptor.generation) {
+      // A new incarnation is a new process: reusing the boot it replaces would fence the
+      // very identity it registers.
+      if (descriptor.boot == existing.descriptor.boot) {
+        return rejected(ErrorCode::Conflict, "register_agent", agent.to_string(),
+                        "a new incarnation requires a new boot identity",
+                        ScheduleOutcome::RejectStaleAgentBoot);
+      }
       const AgentBootId previous_boot = existing.descriptor.boot;
       const AgentGeneration previous_generation = existing.descriptor.generation;
       if (!previous_boot.is_zero()) {
         internal::fence_boot(*impl_, agent, previous_boot, previous_generation, "replaced by reincarnation");
-        close_all_active(*impl_, previous_boot, AssignmentState::Lost, InvalidationReason::AgentFenced,
+        close_all_active(*impl_, agent, previous_boot, AssignmentState::Lost, InvalidationReason::AgentFenced,
                          "agent incarnation replaced by a newer generation");
       }
       AgentRecord fresh;
@@ -372,6 +425,18 @@ MutationResult AgentScheduler::register_agent(const AgentDescriptor& descriptor)
       return MutationResult::success();
     }
     // Same incarnation: re-registration refreshes the session lease and identity metadata.
+    // It can neither move the registration generation backwards nor change what the
+    // agent is eligible for underneath assignments it may already hold.
+    if (descriptor.registration_generation < existing.descriptor.registration_generation) {
+      return rejected(ErrorCode::StaleGeneration, "register_agent", agent.to_string(),
+                      "registration generation is stale", ScheduleOutcome::RejectStaleAgentGeneration);
+    }
+    if (eligibility_changes(existing.descriptor, descriptor)) {
+      return rejected(ErrorCode::Conflict, "register_agent", agent.to_string(),
+                      "a changed tenant, namespace, policy labels, placement, topology or concurrency "
+                      "requires a new agent generation",
+                      ScheduleOutcome::RejectConflict);
+    }
     existing.descriptor = descriptor;
     internal::canonicalize(existing.descriptor.policy_labels);
     existing.descriptor.registration_generation = descriptor.registration_generation;
@@ -390,6 +455,10 @@ MutationResult AgentScheduler::register_agent(const AgentDescriptor& descriptor)
   if (impl_->agents.size() >= impl_->limits.max_agents) {
     return rejected(ErrorCode::LimitExceeded, "register_agent", agent.to_string(),
                     "agent count exceeds max_agents", ScheduleOutcome::RejectLimitExceeded);
+  }
+  if (internal::boot_is_fenced(*impl_, agent, descriptor.boot)) {
+    return rejected(ErrorCode::Fenced, "register_agent", agent.to_string(),
+                    "incarnation is permanently fenced", ScheduleOutcome::RejectFenced);
   }
   AgentRecord record;
   record.descriptor = descriptor;
@@ -652,7 +721,7 @@ MutationResult AgentScheduler::drain_agent(AgentId agent, AgentBootId boot, bool
   record.lifecycle = AgentLifecycle::Draining;
   record.reason = "draining";
   if (force) {
-    close_all_active(*impl_, boot, AssignmentState::Invalidated, InvalidationReason::AgentDrained,
+    close_all_active(*impl_, agent, boot, AssignmentState::Invalidated, InvalidationReason::AgentDrained,
                      "forced drain invalidated the assignment");
   }
   refresh_agent(*impl_, record);
@@ -680,7 +749,7 @@ MutationResult AgentScheduler::deregister_agent(AgentId agent, AgentBootId boot,
                     ScheduleOutcome::RejectDrain);
   }
   if (active > 0) {
-    close_all_active(*impl_, boot, AssignmentState::Invalidated, InvalidationReason::AgentRetired,
+    close_all_active(*impl_, agent, boot, AssignmentState::Invalidated, InvalidationReason::AgentRetired,
                      "forced deregistration invalidated the assignment");
   }
   internal::fence_boot(*impl_, agent, boot, record.descriptor.generation, "deregistered");
@@ -716,11 +785,11 @@ MutationResult AgentScheduler::declare_agent_lost(AgentId agent, AgentBootId boo
     return MutationResult::success();
   }
   internal::fence_boot(*impl_, agent, boot, record.descriptor.generation, reason);
-  close_all_active(*impl_, boot, AssignmentState::Lost, InvalidationReason::AgentLost,
+  close_all_active(*impl_, agent, boot, AssignmentState::Lost, InvalidationReason::AgentLost,
                    "agent incarnation was declared lost");
   internal::invalidate_dynamic_evidence(record);
   record.lifecycle = AgentLifecycle::Lost;
-  record.reason = std::move(reason);
+  record.reason = internal::bounded_text(*impl_, std::move(reason));
   refresh_agent(*impl_, record);
   ++impl_->state_revision;
   return MutationResult::success();
@@ -808,6 +877,13 @@ MutationResult AgentScheduler::submit_work(const WorkRequest& request) {
                       "conflicting work publication for the current generation",
                       ScheduleOutcome::RejectConflict);
     }
+    // Every check runs before anything changes: a refused re-admission leaves no trace.
+    if (const auto queue_check = check_queue(*impl_, canonical); !queue_check.ok()) {
+      return queue_check;
+    }
+    if (const auto tenant_check = check_tenant(*impl_, canonical.requirements.tenant); !tenant_check.ok()) {
+      return tenant_check;
+    }
     for (auto& entry : impl_->assignments) {
       if (entry.second.binding.work == work_id && assignment_state_is_active(entry.second.state)) {
         internal::close_assignment(*impl_, entry.second, AssignmentState::Superseded,
@@ -844,6 +920,12 @@ MutationResult AgentScheduler::submit_work(const WorkRequest& request) {
   if (impl_->work.size() >= impl_->limits.max_work_items) {
     return rejected(ErrorCode::LimitExceeded, "submit_work", work_id.to_string(),
                     "work item count exceeds max_work_items", ScheduleOutcome::RejectLimitExceeded);
+  }
+  if (const auto queue_check = check_queue(*impl_, canonical); !queue_check.ok()) {
+    return queue_check;
+  }
+  if (const auto tenant_check = check_tenant(*impl_, canonical.requirements.tenant); !tenant_check.ok()) {
+    return tenant_check;
   }
   WorkRecord record;
   record.request = canonical;
@@ -905,6 +987,7 @@ MutationResult AgentScheduler::cancel_work(WorkId work, WorkGeneration generatio
     return rejected(ErrorCode::Conflict, "cancel_work", work.to_string(),
                     "work is already terminal", ScheduleOutcome::RejectConflict);
   }
+  reason = internal::bounded_text(*impl_, std::move(reason));
   for (auto& entry : impl_->assignments) {
     if (entry.second.binding.work == work && assignment_state_is_active(entry.second.state)) {
       internal::close_assignment(*impl_, entry.second, AssignmentState::Cancelled,
@@ -932,6 +1015,11 @@ MutationResult AgentScheduler::supersede_work(WorkId work,
     return problem;
   }
   const std::lock_guard<std::mutex> guard(impl_->mutex);
+  // Supersession admits a new generation: it is refused once admission has closed.
+  if (!impl_->admission_open) {
+    return rejected(ErrorCode::AdmissionClosed, "supersede_work", work.to_string(), "admission is closed",
+                    ScheduleOutcome::ShuttingDown);
+  }
   const auto found = impl_->work.find(work);
   if (found == impl_->work.end()) {
     return rejected(ErrorCode::NotFound, "supersede_work", work.to_string(), "work is not known",
@@ -950,6 +1038,13 @@ MutationResult AgentScheduler::supersede_work(WorkId work,
   if (record.lifecycle == WorkLifecycle::Cancelled) {
     return rejected(ErrorCode::Cancelled, "supersede_work", work.to_string(), "work is cancelled",
                     ScheduleOutcome::RejectCancelled);
+  }
+  // Every check runs before anything changes: a refused supersession leaves no trace.
+  if (const auto queue_check = check_queue(*impl_, canonical); !queue_check.ok()) {
+    return queue_check;
+  }
+  if (const auto tenant_check = check_tenant(*impl_, canonical.requirements.tenant); !tenant_check.ok()) {
+    return tenant_check;
   }
   for (auto& entry : impl_->assignments) {
     if (entry.second.binding.work == work && assignment_state_is_active(entry.second.state)) {

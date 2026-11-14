@@ -83,6 +83,18 @@ MutationResult CoordinatorServer::start() {
   if (const auto started = scheduler_.start(); !started.ok()) {
     return started;
   }
+  // Starting advanced the scheduler and coordinator epochs. They are made durable before a
+  // single session is served, so a restart after a crash can never reuse them.
+  if (options_.persist_on_stop && !options_.persistence_path.empty()) {
+    if (const auto saved = scheduler_.save(options_.persistence_path); !saved.ok()) {
+      (void)scheduler_.shutdown();
+      return saved;
+    }
+  }
+  {
+    const std::lock_guard<std::mutex> guard(reap_mutex_);
+    reap_stopping_ = false;
+  }
   if (const auto listening = listener_.listen_loopback(options_.port, options_.limits.max_accept_backlog);
       !listening.ok()) {
     return listening;
@@ -115,6 +127,11 @@ MutationResult CoordinatorServer::stop() {
     return MutationResult::success();
   }
   listener_.close();
+  // The accept loop is joined first, so no session can be accepted after the session
+  // table has been taken over below.
+  if (accept_thread_.joinable()) {
+    accept_thread_.join();
+  }
   (void)scheduler_.shutdown();
   std::vector<std::shared_ptr<Session>> sessions;
   {
@@ -127,9 +144,6 @@ MutationResult CoordinatorServer::stop() {
   }
   for (const auto& session : sessions) {
     session->request_close();
-  }
-  if (accept_thread_.joinable()) {
-    accept_thread_.join();
   }
   for (const auto& session : sessions) {
     session->join();
@@ -240,6 +254,7 @@ bool CoordinatorServer::push_assignment(AgentId agent,
 void CoordinatorServer::on_closed(Session& session, std::string reason) {
   std::shared_ptr<Session> keep_alive;
   std::optional<std::pair<AgentId, AgentBootId>> bound;
+  bool carried_incarnation = false;
   {
     const std::lock_guard<std::mutex> guard(sessions_mutex_);
     const auto found = sessions_.find(session.id());
@@ -253,6 +268,7 @@ void CoordinatorServer::on_closed(Session& session, std::string reason) {
       if (agent_entry != agent_sessions_.end() && agent_entry->second.first == bound->second &&
           agent_entry->second.second == session.id()) {
         agent_sessions_.erase(agent_entry);
+        carried_incarnation = true;
       }
     }
   }
@@ -267,7 +283,11 @@ void CoordinatorServer::on_closed(Session& session, std::string reason) {
     lock.unlock();
     reap_cv_.notify_all();
   }
-  if (bound.has_value()) {
+  // Only the session that currently carries an incarnation speaks for it: a superseded
+  // session, or one the incarnation deregistered from, closing says nothing about the
+  // process. Sessions closed because the coordinator itself is stopping say nothing
+  // either; the incarnation is restored by recovery and re-registers.
+  if (bound.has_value() && carried_incarnation && running_.load(std::memory_order_acquire)) {
     (void)scheduler_.declare_agent_lost(bound->first, bound->second,
                                         reason.empty() ? std::string("session closed") : reason);
   }

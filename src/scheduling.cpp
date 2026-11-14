@@ -79,7 +79,7 @@ void reject(CandidateEvaluation& evaluation, ScheduleOutcome outcome, std::strin
           ? agent_record.descriptor.max_concurrency - agent_record.active_assignments
           : 0;
 
-  if (internal::boot_is_fenced(impl, agent_record.descriptor.boot)) {
+  if (internal::boot_is_fenced(impl, agent_record.descriptor.id, agent_record.descriptor.boot)) {
     reject(evaluation, ScheduleOutcome::RejectFenced, "incarnation is permanently fenced");
     return false;
   }
@@ -706,6 +706,16 @@ PlanResult plan_locked(Impl& impl, WorkRecord& work_record) {
     detail = "work was superseded before commit";
     return ScheduleOutcome::RejectSuperseded;
   }
+  if (work_is_terminal(work_record.lifecycle)) {
+    detail = "work finished before commit";
+    return ScheduleOutcome::RejectConflict;
+  }
+  // The plan bound the next assignment generation of the work. Any assignment made since
+  // (and possibly already closed) makes this plan stale.
+  if (binding.generation.value() != work_record.last_assignment_generation.value() + 1) {
+    detail = "the work was assigned after this plan was made";
+    return ScheduleOutcome::RejectConflict;
+  }
   if (!work_accepts_assignment(work_record.lifecycle) && work_record.current_assignments > 0) {
     const bool fanout_open = work_record.request.mode == SchedulingMode::Parallel &&
                              work_record.current_assignments <
@@ -743,7 +753,7 @@ PlanResult plan_locked(Impl& impl, WorkRecord& work_record) {
     detail = "agent incarnation replaced before commit";
     return ScheduleOutcome::RejectStaleAgentBoot;
   }
-  if (internal::boot_is_fenced(impl, binding.boot)) {
+  if (internal::boot_is_fenced(impl, binding.agent, binding.boot)) {
     detail = "agent incarnation fenced before commit";
     return ScheduleOutcome::RejectFenced;
   }
@@ -786,12 +796,20 @@ PlanResult plan_locked(Impl& impl, WorkRecord& work_record) {
     return ScheduleOutcome::RejectReservation;
   }
 
+  if (!internal::make_room_for_assignment(impl)) {
+    detail = "the bound on active assignments, assignment history or leases is reached";
+    return ScheduleOutcome::RejectLimitExceeded;
+  }
   AssignmentRecord record;
   record.binding = binding;
   record.state = AssignmentState::Assigned;
   record.lease_current = true;
   record.reason = "assigned";
   auto inserted = impl.assignments.emplace(binding.id, std::move(record));
+  if (!inserted.second) {
+    detail = "the assignment already exists";
+    return ScheduleOutcome::RejectConflict;
+  }
   LeaseRecord lease_record;
   lease_record.lease.id = binding.lease;
   lease_record.lease.generation = binding.lease_generation;
@@ -921,8 +939,10 @@ PlanResult plan_locked(Impl& impl, WorkRecord& work_record) {
 
 ScheduleDecision AgentScheduler::schedule(WorkId work, WorkGeneration generation) {
   PlanResult plan;
+  const internal::FeasibilityVerdicts planning_verdicts = internal::evaluate_feasibility_unlocked(*impl_, {work});
   {
     const std::lock_guard<std::mutex> guard(impl_->mutex);
+    const internal::FeasibilityScope verdicts_in_scope(planning_verdicts);
     const auto found = impl_->work.find(work);
     if (found == impl_->work.end()) {
       plan.decision.outcome = ScheduleOutcome::RejectInvalidRequest;
@@ -946,8 +966,10 @@ ScheduleDecision AgentScheduler::schedule(WorkId work, WorkGeneration generation
   // The interlock runs without the authoritative state lock: a racing mutation may
   // interleave here, and the commit below revalidates every bound authority.
   impl_->interlock->at(InterlockPoint::BeforeScheduleCommit);
+  const internal::FeasibilityVerdicts commit_verdicts = internal::evaluate_feasibility_unlocked(*impl_, {work});
   {
     const std::lock_guard<std::mutex> guard(impl_->mutex);
+    const internal::FeasibilityScope verdicts_in_scope(commit_verdicts);
     std::string detail;
     const auto failure = commit_locked(*impl_, work, generation, *plan.binding, detail);
     if (failure.has_value()) {
@@ -973,7 +995,18 @@ ScheduleDecision AgentScheduler::schedule(WorkId work, WorkGeneration generation
 
 BatchDecision AgentScheduler::schedule_batch(const ScheduleRequest& request) {
   BatchDecision batch;
+  std::vector<WorkId> unfinished;
+  if (impl_->feasibility) {
+    const std::lock_guard<std::mutex> guard(impl_->mutex);
+    for (const auto& entry : impl_->work) {
+      if (!work_is_terminal(entry.second.lifecycle)) {
+        unfinished.push_back(entry.first);
+      }
+    }
+  }
+  const internal::FeasibilityVerdicts verdicts = internal::evaluate_feasibility_unlocked(*impl_, unfinished);
   const std::lock_guard<std::mutex> guard(impl_->mutex);
+  const internal::FeasibilityScope verdicts_in_scope(verdicts);
   if (!impl_->running || !impl_->admission_open) {
     batch.outcome = ScheduleOutcome::ShuttingDown;
     return batch;
@@ -1108,8 +1141,20 @@ BatchDecision AgentScheduler::schedule_batch(const ScheduleRequest& request) {
 DispatchResult AgentScheduler::dispatch(AssignmentId assignment, AssignmentGeneration generation) {
   DispatchResult result;
   AssignmentBinding handoff;
+  const auto verdicts_for_assignment = [this, assignment]() {
+    std::vector<WorkId> work;
+    if (impl_->feasibility) {
+      const std::lock_guard<std::mutex> guard(impl_->mutex);
+      if (const auto found = impl_->assignments.find(assignment); found != impl_->assignments.end()) {
+        work.push_back(found->second.binding.work);
+      }
+    }
+    return internal::evaluate_feasibility_unlocked(*impl_, work);
+  };
+  const internal::FeasibilityVerdicts first_verdicts = verdicts_for_assignment();
   {
     const std::lock_guard<std::mutex> guard(impl_->mutex);
+    const internal::FeasibilityScope verdicts_in_scope(first_verdicts);
     const auto found = impl_->assignments.find(assignment);
     if (found == impl_->assignments.end()) {
       result.outcome = ScheduleOutcome::RejectStaleAssignment;
@@ -1126,7 +1171,7 @@ DispatchResult AgentScheduler::dispatch(AssignmentId assignment, AssignmentGener
       result.detail = "scheduler is shutting down";
       return result;
     }
-    if (internal::boot_is_fenced(*impl_, found->second.binding.boot)) {
+    if (internal::boot_is_fenced(*impl_, found->second.binding.agent, found->second.binding.boot)) {
       result.outcome = ScheduleOutcome::RejectStaleAgentBoot;
       result.detail = "assignment incarnation is permanently fenced";
       return result;
@@ -1161,7 +1206,9 @@ DispatchResult AgentScheduler::dispatch(AssignmentId assignment, AssignmentGener
     handoff = found->second.binding;
   }
   impl_->interlock->at(InterlockPoint::BeforeDispatchHandoff);
+  const internal::FeasibilityVerdicts handoff_verdicts = verdicts_for_assignment();
   const std::lock_guard<std::mutex> guard(impl_->mutex);
+  const internal::FeasibilityScope verdicts_in_scope(handoff_verdicts);
   const auto found = impl_->assignments.find(assignment);
   if (found == impl_->assignments.end() || found->second.binding.generation != generation) {
     result.outcome = ScheduleOutcome::RejectStaleAssignment;
@@ -1172,6 +1219,17 @@ DispatchResult AgentScheduler::dispatch(AssignmentId assignment, AssignmentGener
     result.outcome = found->second.state == AssignmentState::Dispatched ? ScheduleOutcome::NoChange
                                                                        : ScheduleOutcome::RejectStaleAssignment;
     result.detail = "assignment state changed before handoff";
+    return result;
+  }
+  // Everything checked before the pause is checked again after it.
+  if (!impl_->running || impl_->shutting_down) {
+    result.outcome = ScheduleOutcome::ShuttingDown;
+    result.detail = "scheduler is shutting down";
+    return result;
+  }
+  if (!found->second.lease_current || found->second.binding.lease_expires_at_ms < impl_->now_ms()) {
+    result.outcome = ScheduleOutcome::RejectLeaseExpired;
+    result.detail = "assignment lease expired before handoff";
     return result;
   }
   std::string detail;
@@ -1227,12 +1285,14 @@ AssignmentLookup lookup_assignment(Impl& impl,
     result.outcome = ScheduleOutcome::RejectStaleAssignment;
     return result;
   }
-  if (!boot.is_zero() && record.binding.boot != boot) {
+  // An observation must come from the incarnation the assignment is bound to; one that
+  // names no incarnation at all is not from it.
+  if (boot.is_zero() || record.binding.boot != boot) {
     result.problem = "observation names a different incarnation";
     result.outcome = ScheduleOutcome::RejectStaleAgentBoot;
     return result;
   }
-  if (internal::boot_is_fenced(impl, record.binding.boot)) {
+  if (internal::boot_is_fenced(impl, record.binding.agent, record.binding.boot)) {
     result.problem = "incarnation is fenced";
     result.outcome = ScheduleOutcome::RejectStaleAgentBoot;
     return result;
@@ -1477,7 +1537,18 @@ MutationResult AgentScheduler::reject_assignment(AssignmentId assignment,
 // ---------------------------------------------------------------------------
 
 RevalidationReport AgentScheduler::revalidate_assignments() {
+  std::vector<WorkId> work;
+  if (impl_->feasibility) {
+    const std::lock_guard<std::mutex> guard(impl_->mutex);
+    for (const auto& entry : impl_->assignments) {
+      if (entry.second.state == AssignmentState::RevalidationRequired) {
+        work.push_back(entry.second.binding.work);
+      }
+    }
+  }
+  const internal::FeasibilityVerdicts verdicts = internal::evaluate_feasibility_unlocked(*impl_, work);
   const std::lock_guard<std::mutex> guard(impl_->mutex);
+  const internal::FeasibilityScope verdicts_in_scope(verdicts);
   RevalidationReport report;
   for (auto& entry : impl_->assignments) {
     AssignmentRecord& record = entry.second;
@@ -1534,7 +1605,19 @@ RevalidationReport AgentScheduler::revalidate_assignments() {
 }
 
 RevalidationReport AgentScheduler::revalidate_agent_assignments(AgentId agent, AgentBootId boot) {
+  std::vector<WorkId> work;
+  if (impl_->feasibility) {
+    const std::lock_guard<std::mutex> guard(impl_->mutex);
+    for (const auto& entry : impl_->assignments) {
+      if (entry.second.binding.agent == agent && entry.second.binding.boot == boot &&
+          entry.second.state == AssignmentState::RevalidationRequired) {
+        work.push_back(entry.second.binding.work);
+      }
+    }
+  }
+  const internal::FeasibilityVerdicts verdicts = internal::evaluate_feasibility_unlocked(*impl_, work);
   const std::lock_guard<std::mutex> guard(impl_->mutex);
+  const internal::FeasibilityScope verdicts_in_scope(verdicts);
   RevalidationReport report;
   const auto agent_entry = impl_->agents.find(agent);
   if (agent_entry == impl_->agents.end() || agent_entry->second.descriptor.boot != boot) {
